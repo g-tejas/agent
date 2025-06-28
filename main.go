@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -55,6 +57,55 @@ func loadConversation() ([]anthropic.MessageParam, error) {
 	decoder := json.NewDecoder(file)
 	err = decoder.Decode(&conversation)
 	return conversation, err
+}
+
+// formatForTelegram converts markdown text to Telegram-compatible HTML format
+func formatForTelegram(text string) string {
+	// Escape HTML entities that aren't part of formatting
+	text = strings.ReplaceAll(text, "&", "&amp;")
+	text = strings.ReplaceAll(text, "<", "&lt;")
+	text = strings.ReplaceAll(text, ">", "&gt;")
+
+	// Convert code blocks first (to avoid interference with other formatting)
+	codeBlockRegex := regexp.MustCompile("```([a-zA-Z]*)\n?((?s:.*?))\n?```")
+	text = codeBlockRegex.ReplaceAllStringFunc(text, func(match string) string {
+		parts := codeBlockRegex.FindStringSubmatch(match)
+		if len(parts) >= 3 {
+			language := parts[1]
+			code := strings.TrimSpace(parts[2])
+			if language != "" {
+				return fmt.Sprintf("<pre><code class=\"language-%s\">%s</code></pre>", language, code)
+			}
+			return fmt.Sprintf("<pre>%s</pre>", code)
+		}
+		return match
+	})
+
+	// Convert inline code
+	inlineCodeRegex := regexp.MustCompile("`([^`]+)`")
+	text = inlineCodeRegex.ReplaceAllString(text, "<code>$1</code>")
+
+	// Convert bold
+	boldRegex := regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	text = boldRegex.ReplaceAllString(text, "<b>$1</b>")
+
+	// Convert italic
+	italicRegex := regexp.MustCompile(`\*([^*]+)\*`)
+	text = italicRegex.ReplaceAllString(text, "<i>$1</i>")
+
+	// Convert underline (if using __text__)
+	underlineRegex := regexp.MustCompile(`__([^_]+)__`)
+	text = underlineRegex.ReplaceAllString(text, "<u>$1</u>")
+
+	// Convert strikethrough (if using ~~text~~)
+	strikethroughRegex := regexp.MustCompile(`~~([^~]+)~~`)
+	text = strikethroughRegex.ReplaceAllString(text, "<s>$1</s>")
+
+	// Convert links
+	linkRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
+	text = linkRegex.ReplaceAllString(text, "<a href=\"$2\">$1</a>")
+
+	return text
 }
 
 func main() {
@@ -177,10 +228,12 @@ func main() {
 								}
 								firstEdit = false
 							}
+							formattedText := formatForTelegram(message.Content[0].Text)
 							_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
 								ChatID:    chatID,
 								MessageID: sentMsg.ID,
-								Text:      message.Content[0].Text,
+								Text:      formattedText,
+								ParseMode: models.ParseModeHTML,
 							})
 							if err != nil {
 								log.Panic(err)
