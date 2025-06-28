@@ -61,55 +61,141 @@ func loadConversation() ([]anthropic.MessageParam, error) {
 
 // formatForTelegram converts markdown text to Telegram-compatible HTML format
 func formatForTelegram(text string) string {
-	// Escape HTML entities that aren't part of formatting
-	text = strings.ReplaceAll(text, "&", "&amp;")
-	text = strings.ReplaceAll(text, "<", "&lt;")
-	text = strings.ReplaceAll(text, ">", "&gt;")
-
-	// Convert markdown headers to bold text (instead of HTML headers)
-	headerRegex := regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
-	text = headerRegex.ReplaceAllString(text, "<b>$1</b>")
-
-	// Convert code blocks first (to avoid interference with other formatting)
+	// Store code blocks temporarily to avoid processing their content
+	codeBlocks := make(map[string]string)
+	codeBlockCounter := 0
+	
+	// Extract and temporarily replace code blocks
 	codeBlockRegex := regexp.MustCompile("```([a-zA-Z]*)\n?((?s:.*?))\n?```")
 	text = codeBlockRegex.ReplaceAllStringFunc(text, func(match string) string {
 		parts := codeBlockRegex.FindStringSubmatch(match)
 		if len(parts) >= 3 {
 			language := parts[1]
 			code := strings.TrimSpace(parts[2])
+			
+			// Escape HTML in code content
+			code = strings.ReplaceAll(code, "&", "&amp;")
+			code = strings.ReplaceAll(code, "<", "&lt;")
+			code = strings.ReplaceAll(code, ">", "&gt;")
+			
+			placeholder := fmt.Sprintf("__CODEBLOCK_%d__", codeBlockCounter)
 			if language != "" {
-				return fmt.Sprintf("<pre><code class=\"language-%s\">%s</code></pre>", language, code)
+				codeBlocks[placeholder] = fmt.Sprintf("<pre><code class=\"language-%s\">%s</code></pre>", language, code)
+			} else {
+				codeBlocks[placeholder] = fmt.Sprintf("<pre>%s</pre>", code)
 			}
-			return fmt.Sprintf("<pre>%s</pre>", code)
+			codeBlockCounter++
+			return placeholder
 		}
 		return match
 	})
 
-	// Convert inline code
+	// Extract and temporarily replace inline code
+	inlineCodes := make(map[string]string)
+	inlineCodeCounter := 0
 	inlineCodeRegex := regexp.MustCompile("`([^`]+)`")
-	text = inlineCodeRegex.ReplaceAllString(text, "<code>$1</code>")
+	text = inlineCodeRegex.ReplaceAllStringFunc(text, func(match string) string {
+		parts := inlineCodeRegex.FindStringSubmatch(match)
+		if len(parts) >= 2 {
+			code := parts[1]
+			// Escape HTML in inline code
+			code = strings.ReplaceAll(code, "&", "&amp;")
+			code = strings.ReplaceAll(code, "<", "&lt;")
+			code = strings.ReplaceAll(code, ">", "&gt;")
+			
+			placeholder := fmt.Sprintf("__INLINE_%d__", inlineCodeCounter)
+			inlineCodes[placeholder] = fmt.Sprintf("<code>%s</code>", code)
+			inlineCodeCounter++
+			return placeholder
+		}
+		return match
+	})
+
+	// Now escape remaining HTML entities (after extracting code)
+	text = strings.ReplaceAll(text, "&", "&amp;")
+	text = strings.ReplaceAll(text, "<", "&lt;")
+	text = strings.ReplaceAll(text, ">", "&gt;")
+
+	// Convert markdown headers to bold text, but strip existing markdown formatting first
+	headerRegex := regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
+	text = headerRegex.ReplaceAllStringFunc(text, func(match string) string {
+		parts := headerRegex.FindStringSubmatch(match)
+		if len(parts) >= 2 {
+			content := strings.TrimSpace(parts[1])
+			// Strip markdown formatting from headers to avoid double conversion
+			content = regexp.MustCompile(`\*\*([^*]+)\*\*`).ReplaceAllString(content, "$1")
+			content = regexp.MustCompile(`__([^_]+)__`).ReplaceAllString(content, "$1")
+			content = regexp.MustCompile(`\*([^*]+)\*`).ReplaceAllString(content, "$1")
+			content = regexp.MustCompile(`~~([^~]+)~~`).ReplaceAllString(content, "$1")
+			
+			// Don't wrap empty or single character content
+			if len(strings.TrimSpace(content)) > 1 {
+				return fmt.Sprintf("<b>%s</b>", content)
+			}
+			return content
+		}
+		return match
+	})
 
 	// Convert **bold** to bold (for headers and section titles)
-	boldRegex := regexp.MustCompile(`\*\*([^*]+)\*\*`)
+	boldRegex := regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
 	text = boldRegex.ReplaceAllString(text, "<b>$1</b>")
 
 	// Convert __underline__ to underline (for key point emphasis)
-	underlineRegex := regexp.MustCompile(`__([^_]+)__`)
+	underlineRegex := regexp.MustCompile(`__([^_\n]+)__`)
 	text = underlineRegex.ReplaceAllString(text, "<u>$1</u>")
 
-	// Convert italic
-	italicRegex := regexp.MustCompile(`\*([^*]+)\*`)
+	// Convert *italic* but be careful not to match ** patterns
+	italicRegex := regexp.MustCompile(`(?<!\*)\*([^*\n]+)\*(?!\*)`)
 	text = italicRegex.ReplaceAllString(text, "<i>$1</i>")
 
 	// Convert strikethrough (if using ~~text~~)
-	strikethroughRegex := regexp.MustCompile(`~~([^~]+)~~`)
+	strikethroughRegex := regexp.MustCompile(`~~([^~\n]+)~~`)
 	text = strikethroughRegex.ReplaceAllString(text, "<s>$1</s>")
 
 	// Convert links
 	linkRegex := regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	text = linkRegex.ReplaceAllString(text, "<a href=\"$2\">$1</a>")
 
+	// Restore code blocks
+	for placeholder, code := range codeBlocks {
+		text = strings.ReplaceAll(text, placeholder, code)
+	}
+
+	// Restore inline codes
+	for placeholder, code := range inlineCodes {
+		text = strings.ReplaceAll(text, placeholder, code)
+	}
+
+	// Clean up any malformed HTML or duplicate tags
+	text = cleanupHTML(text)
+
 	return text
+}
+
+// cleanupHTML fixes common HTML issues that could cause Telegram parsing errors
+func cleanupHTML(html string) string {
+	// Remove empty tags
+	emptyTagRegex := regexp.MustCompile(`<(b|i|u|s|code)>\s*</\1>`)
+	html = emptyTagRegex.ReplaceAllString(html, "")
+	
+	// Fix nested identical tags (e.g., <b><b>text</b></b> -> <b>text</b>)
+	for _, tag := range []string{"b", "i", "u", "s", "code"} {
+		nestedRegex := regexp.MustCompile(fmt.Sprintf(`<%s>(\s*<%s>(.+?)</%s>\s*)</%s>`, tag, tag, tag, tag))
+		for nestedRegex.MatchString(html) {
+			html = nestedRegex.ReplaceAllString(html, fmt.Sprintf(`<%s>$2</%s>`, tag, tag))
+		}
+	}
+	
+	// Remove orphaned single characters in tags (like <b>#</b>)
+	orphanRegex := regexp.MustCompile(`<(b|i|u|s)>([^a-zA-Z0-9\s])</\1>`)
+	html = orphanRegex.ReplaceAllString(html, "$2")
+	
+	// Clean up multiple consecutive whitespace while preserving single spaces
+	whitespaceRegex := regexp.MustCompile(`\s+`)
+	html = whitespaceRegex.ReplaceAllString(html, " ")
+	
+	return strings.TrimSpace(html)
 }
 
 func main() {
