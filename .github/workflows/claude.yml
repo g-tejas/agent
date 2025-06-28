@@ -1,4 +1,7 @@
 name: Claude Assistant
+permissions:
+  issues: write
+  contents: read
 on:
   issue_comment:
     types: [created]
