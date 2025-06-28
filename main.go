@@ -66,6 +66,10 @@ func formatForTelegram(text string) string {
 	text = strings.ReplaceAll(text, "<", "&lt;")
 	text = strings.ReplaceAll(text, ">", "&gt;")
 
+	// Convert markdown headers to bold text (instead of HTML headers)
+	headerRegex := regexp.MustCompile(`(?m)^#{1,6}\s*(.+)$`)
+	text = headerRegex.ReplaceAllString(text, "<b>$1</b>")
+
 	// Convert code blocks first (to avoid interference with other formatting)
 	codeBlockRegex := regexp.MustCompile("```([a-zA-Z]*)\n?((?s:.*?))\n?```")
 	text = codeBlockRegex.ReplaceAllStringFunc(text, func(match string) string {
@@ -85,17 +89,17 @@ func formatForTelegram(text string) string {
 	inlineCodeRegex := regexp.MustCompile("`([^`]+)`")
 	text = inlineCodeRegex.ReplaceAllString(text, "<code>$1</code>")
 
-	// Convert bold
+	// Convert **bold** to bold (for headers and section titles)
 	boldRegex := regexp.MustCompile(`\*\*([^*]+)\*\*`)
 	text = boldRegex.ReplaceAllString(text, "<b>$1</b>")
+
+	// Convert __underline__ to underline (for key point emphasis)
+	underlineRegex := regexp.MustCompile(`__([^_]+)__`)
+	text = underlineRegex.ReplaceAllString(text, "<u>$1</u>")
 
 	// Convert italic
 	italicRegex := regexp.MustCompile(`\*([^*]+)\*`)
 	text = italicRegex.ReplaceAllString(text, "<i>$1</i>")
-
-	// Convert underline (if using __text__)
-	underlineRegex := regexp.MustCompile(`__([^_]+)__`)
-	text = underlineRegex.ReplaceAllString(text, "<u>$1</u>")
 
 	// Convert strikethrough (if using ~~text~~)
 	strikethroughRegex := regexp.MustCompile(`~~([^~]+)~~`)
@@ -198,6 +202,7 @@ func main() {
 				lastSendTime := time.Now()
 				batchThreshold := 100 * time.Millisecond
 				firstEdit := true
+				lastSentText := ""
 				for stream.Next() {
 					event := stream.Current()
 					err := message.Accumulate(event)
@@ -208,38 +213,44 @@ func main() {
 					now := time.Now()
 					if firstEdit || now.Sub(lastSendTime) >= batchThreshold {
 						if len(message.Content) > 0 && len(message.Content[0].Text) > 0 {
-							if firstEdit {
-								_, err = luffy.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
-									ChatID:    chatID,
-									MessageID: sentMsg.ID,
-									Reaction: []models.ReactionType{
-										{
-											Type: models.ReactionTypeTypeEmoji,
-											ReactionTypeEmoji: &models.ReactionTypeEmoji{
-												Type:  models.ReactionTypeTypeEmoji,
-												Emoji: "✍",
+							formattedText := formatForTelegram(message.Content[0].Text)
+							
+							// Only edit if the content has changed
+							if formattedText != lastSentText {
+								if firstEdit {
+									_, err = luffy.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
+										ChatID:    chatID,
+										MessageID: sentMsg.ID,
+										Reaction: []models.ReactionType{
+											{
+												Type: models.ReactionTypeTypeEmoji,
+												ReactionTypeEmoji: &models.ReactionTypeEmoji{
+													Type:  models.ReactionTypeTypeEmoji,
+													Emoji: "✍",
+												},
 											},
 										},
-									},
+									})
+									if err != nil {
+										log.Panic(err)
+										return
+									}
+									firstEdit = false
+								}
+								
+								_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
+									ChatID:    chatID,
+									MessageID: sentMsg.ID,
+									Text:      formattedText,
+									ParseMode: models.ParseModeHTML,
 								})
 								if err != nil {
 									log.Panic(err)
 									return
 								}
-								firstEdit = false
+								lastSentText = formattedText
+								lastSendTime = now
 							}
-							formattedText := formatForTelegram(message.Content[0].Text)
-							_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
-								ChatID:    chatID,
-								MessageID: sentMsg.ID,
-								Text:      formattedText,
-								ParseMode: models.ParseModeHTML,
-							})
-							if err != nil {
-								log.Panic(err)
-								return
-							}
-							lastSendTime = now
 						}
 					}
 				}
