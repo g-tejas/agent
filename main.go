@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -25,37 +24,7 @@ type BotStats struct {
 	errors         int64
 }
 
-const conversationFile = "conversation.json"
 const promptFile = "Prompt.md"
-
-func saveConversation(conversation []anthropic.MessageParam) error {
-	file, err := os.Create(conversationFile)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	encoder := json.NewEncoder(file)
-	return encoder.Encode(conversation)
-}
-
-func loadConversation() ([]anthropic.MessageParam, error) {
-	var conversation []anthropic.MessageParam
-
-	file, err := os.Open(conversationFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// File doesn't exist, return empty slice
-			return conversation, nil
-		}
-		return nil, err
-	}
-	defer file.Close()
-
-	decoder := json.NewDecoder(file)
-	err = decoder.Decode(&conversation)
-	return conversation, err
-}
 
 func main() {
 	tgBotToken := os.Getenv("TG_BOT_TOKEN")
@@ -75,8 +44,14 @@ func main() {
 
 	opts := []bot.Option{
 		bot.WithDefaultHandler(func(ctx context.Context, b *bot.Bot, update *models.Update) {
-			tgStream <- update
-			// TODO: close the channel, when we get a context update
+			select {
+			case tgStream <- update:
+				// Successfully sent update
+			case <-ctx.Done():
+				// Context cancelled, close channel and return
+				close(tgStream)
+				return
+			}
 		}),
 	}
 
@@ -89,21 +64,7 @@ func main() {
 	go luffy.Start(ctx)
 
 	ai := anthropic.NewClient()
-	conversation, err := loadConversation()
-	if err != nil {
-		log.Printf("Error loading conversation: %v", err)
-		conversation = []anthropic.MessageParam{}
-	} else {
-		fmt.Printf("Loaded %d messages from previous session\n", len(conversation))
-	}
-
-	defer func() {
-		if err := saveConversation(conversation); err != nil {
-			log.Printf("Error saving conversation: %v", err)
-		} else {
-			fmt.Printf("Saved %d messages\n", len(conversation))
-		}
-	}()
+	conversation := []anthropic.MessageParam{}
 
 	promptTxt, err := os.ReadFile(promptFile)
 	if err != nil {
@@ -145,8 +106,9 @@ func main() {
 
 				message := anthropic.Message{}
 				lastSendTime := time.Now()
-				batchThreshold := 100 * time.Millisecond
+				batchThreshold := 1 * time.Second
 				firstEdit := true
+				lastSentText := ""
 				for stream.Next() {
 					event := stream.Current()
 					err := message.Accumulate(event)
@@ -157,44 +119,72 @@ func main() {
 					now := time.Now()
 					if firstEdit || now.Sub(lastSendTime) >= batchThreshold {
 						if len(message.Content) > 0 && len(message.Content[0].Text) > 0 {
-							if firstEdit {
-								_, err = luffy.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
-									ChatID:    chatID,
-									MessageID: sentMsg.ID,
-									Reaction: []models.ReactionType{
-										{
-											Type: models.ReactionTypeTypeEmoji,
-											ReactionTypeEmoji: &models.ReactionTypeEmoji{
-												Type:  models.ReactionTypeTypeEmoji,
-												Emoji: "✍",
+							text := message.Content[0].Text
+
+							// Only edit if the content has changed
+							if text != lastSentText {
+								if firstEdit {
+									_, err = luffy.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
+										ChatID:    chatID,
+										MessageID: sentMsg.ID,
+										Reaction: []models.ReactionType{
+											{
+												Type: models.ReactionTypeTypeEmoji,
+												ReactionTypeEmoji: &models.ReactionTypeEmoji{
+													Type:  models.ReactionTypeTypeEmoji,
+													Emoji: "✍",
+												},
 											},
 										},
-									},
+									})
+									if err != nil {
+										log.Panic(err)
+										return
+									}
+									firstEdit = false
+								}
+
+								_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
+									ChatID:    chatID,
+									MessageID: sentMsg.ID,
+									Text:      text,
 								})
 								if err != nil {
 									log.Panic(err)
 									return
 								}
-								firstEdit = false
+								lastSentText = text
+								lastSendTime = now
 							}
-							_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
-								ChatID:    chatID,
-								MessageID: sentMsg.ID,
-								Text:      message.Content[0].Text,
-							})
-							if err != nil {
-								log.Panic(err)
-								return
-							}
-							lastSendTime = now
 						}
 					}
 				}
-				conversation = append(conversation, message.ToParam())
+
+				// Send final message with HTML parsing if content is complete
+				finalText := ""
+				if len(message.Content) > 0 {
+					finalText = message.Content[0].Text
+				}
+
+				_, err = luffy.EditMessageText(ctx, &bot.EditMessageTextParams{
+					ChatID:    chatID,
+					MessageID: sentMsg.ID,
+					Text:      finalText,
+					ParseMode: models.ParseModeHTML,
+				})
+				if err != nil {
+					log.Panic(err)
+					return
+				}
 
 				if stream.Err() != nil {
 					log.Panic(stream.Err())
 					continue
+				}
+
+				// Only append message if it has content
+				if len(message.Content) > 0 {
+					conversation = append(conversation, message.ToParam())
 				}
 
 				_, err = luffy.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
@@ -212,58 +202,4 @@ func main() {
 			return
 		}
 	}
-
-	// for update := range updates {
-	// 	if update.Message != nil {
-	// 		log.Printf("[%s] %s", update.Message.From.UserName, update.Message.Text)
-
-	// 		chatID := update.Message.Chat.ID
-
-	// 		tgMsg := tgbotapi.NewMessage(chatID, "")
-	// 		tgMsg.ReplyToMessageID = update.Message.MessageID
-	// 		sentMsg, err := bot.Send(tgMsg)
-	// 		if err != nil {
-	// 			log.Panic(err)
-	// 			break
-	//
-	//
-	// 		// // Make the call to the anthropic api servers
-	// 		// message, err := ai.Messages.New(context.TODO(), anthropic.MessageNewParams{
-	// 		// 	Model:     anthropic.ModelClaude4Sonnet20250514,
-	// 		// 	MaxTokens: int64(1024),
-	// 		// 	Messages:  conversation,
-	// 		// 	System: systemPrompt,
-	// 		// })
-	// 		// if err != nil {
-	// 		// 	log.Panic(err)
-	// 		// }
-	// 		// conversation = append(conversation, message.ToParam())
-
-	// 		// for _, content := range message.Content {
-	// 		// 	switch content.Type {
-	// 		// 	case "text":
-	// 		// 		msg := tgbotapi.NewMessage(update.Message.Chat.ID, content.Text)
-	// 		// 		msg.ReplyToMessageID = update.Message.MessageID
-
-	// 		// 		// Delete the thinking Message first
-	// 		// 		deleteMsg := tgbotapi.NewDeleteMessage(msg.ChatID, sentMsg.MessageID)
-	// 		// 		bot.Send(deleteMsg)
-
-	// 		// 		bot.Send(msg)
-	// 		// 	}
-	// 		// }
-	// 	}
-	// }
-}
-
-func NewAgent(client *anthropic.Client, getUserMessage func() (string, bool)) *Agent {
-	return &Agent{
-		client:         client,
-		getUserMessage: getUserMessage,
-	}
-}
-
-type Agent struct {
-	client         *anthropic.Client
-	getUserMessage func() (string, bool)
 }
